@@ -82,18 +82,24 @@ rng = np.random.default_rng(20260921)
 
 # --------------------------------------------------------------------------
 # 1. 仿真参数
-#    Delta_t 与扫频频段已由需求方确认为真实协议值(2026-09-22); 其余仍为占位
-#    假设, 需与实际星闪测距协议核对 —— TODO(实测)
+#    以下已由需求方确认为真实值(2026-09-22): K, Delta_f/N_F, Delta_t, 扫频频段,
+#    工作距离范围, DFT测速的搜索范围/分辨率, 三级速度定义。
+#    单频点 SNR 与基线测距(d_raw)野值/抖动特性仍为占位假设 —— TODO(实测)
 # --------------------------------------------------------------------------
 C_LIGHT = 3e8          # 光速 m/s
-K_PATH = 2             # 单程=1 / 双程=2, 占位取双程                         TODO(实测)
-F_START = 2400e6       # 扫频起始频率 Hz (已确认: 2400MHz)
-F_STOP = 2479e6        # 扫频终止频率 Hz (已确认: 2479MHz, 2.4G ISM频段)
-DELTA_F = 1e6          # 频点间隔 Hz, 占位 1MHz(信道间隔本身仍需现网核实)       TODO(实测)
-N_F = int(round((F_STOP - F_START) / DELTA_F)) + 1  # 由确认的频段/间隔推出, 79MHz/1MHz -> 80个频点
-DELTA_T = 0.2          # 相邻两次测量的时间间隔 s, 已确认: 200ms (5Hz测量率)
-NFFT = 4096            # DFT/IFFT 补零点数, 提高斜率(峰值)搜索分辨率
-D0_RANGE = (0.3, 3.0)  # 仿真使用的典型工作距离范围, m                        TODO(实测)
+K_PATH = 2             # 已确认: 双程(K=2)
+F_START = 2400e6       # 扫频起始频率 Hz (已确认)
+F_STOP = 2479e6        # 扫频终止频率 Hz (已确认, 2.4G ISM频段)
+DELTA_F = 1e6          # 频点间隔 Hz (已确认: 1MHz)
+N_F = int(round((F_STOP - F_START) / DELTA_F)) + 1  # 已确认: 80个频点全用
+DELTA_T = 0.2          # 相邻两次测量的时间间隔 s (已确认: 200ms, 5Hz测量率)
+NFFT = 4096            # DFT/IFFT 补零点数, 用于在限定搜索范围内插值定位峰值
+V_SEARCH_MAX = 5.0     # DFT测速的搜索范围 (已确认: +-5 m/s)
+V_RESOLUTION = 0.05    # DFT测速的速度分辨率 (已确认: 0.05 m/s), 输出按此量化
+D0_RANGE = (1.0, 50.0) # 仿真使用的典型工作距离范围, m (已确认工作距离0~100m+,
+                       # 占位地取中段作为默认场景; 该范围在修正后的公式下对
+                       # std/v_hat 数值基本无影响, 见4.3节循环不变性, 但真实
+                       # 单频点SNR会随距离大幅变化 —— 仍是最关键的未确认量 TODO(实测)
 
 # 两档限幅阈值 (现网取值, 与用户确认)
 STD_TH_LOW = 0.6       # 低速档标准差门限 (无量纲, 见模块说明)
@@ -140,15 +146,21 @@ def circular_std(dphi):
     return float(np.sqrt(np.mean(np.abs(z - mean_vec) ** 2)))
 
 
-def dft_slope_to_speed(dphi, delta_f=DELTA_F, delta_t=DELTA_T, k_path=K_PATH, nfft=NFFT):
-    """对 dphi(k) 做 DFT(補零), 取幅度谱峰值位置换算出等效位移/速度估计."""
+def dft_slope_to_speed(dphi, delta_f=DELTA_F, delta_t=DELTA_T, k_path=K_PATH, nfft=NFFT,
+                        v_search_max=V_SEARCH_MAX, v_resolution=V_RESOLUTION):
+    """对 dphi(k) 做 DFT(補零), 在已确认的 +-5m/s 搜索范围内取幅度谱峰值位置,
+    换算出速度估计, 并按已确认的 0.05m/s 分辨率量化输出 —— 与现网DFT测速的
+    搜索范围/分辨率设定对齐, 而非在整个(未限幅的)DFT不模糊范围内搜索峰值。"""
     s = np.exp(1j * dphi)
     spec = np.fft.fftshift(np.fft.fft(s, n=nfft))
     freq_cyc_per_sample = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0))  # cycles/sample, range (-0.5,0.5]
-    peak_idx = np.argmax(np.abs(spec))
-    f_peak = freq_cyc_per_sample[peak_idx]
-    delta_d_hat = -f_peak * C_LIGHT / (delta_f * k_path)
-    v_hat = delta_d_hat / delta_t
+    v_grid = -freq_cyc_per_sample * C_LIGHT / (delta_f * k_path) / delta_t
+    mask = np.abs(v_grid) <= v_search_max
+    mag = np.abs(spec)
+    local_idx = np.argmax(mag[mask])
+    v_hat_raw = v_grid[mask][local_idx]
+    v_hat = float(np.round(v_hat_raw / v_resolution) * v_resolution)
+    delta_d_hat = v_hat * delta_t
     return v_hat, delta_d_hat
 
 
@@ -259,13 +271,16 @@ def experiment_0b_std_vs_motion():
         ax.plot(delta_d_grid, results[snr], color=colors[snr], linewidth=2, label=f"SNR={snr}dB")
     ax.axhline(STD_TH_STATIC, color=C_GOOD, linewidth=1.2, linestyle=":", label=f"静止门限 {STD_TH_STATIC}")
     ax.axhline(STD_TH_LOW, color=C_CRIT, linewidth=1.0, linestyle=":", label=f"低速门限 {STD_TH_LOW}")
-    v_max_realistic = 2.0 * DELTA_T
-    ax.axvline(v_max_realistic, color=MUTED, linewidth=1.2, linestyle="--",
-               label=f"2m/s×Δt={v_max_realistic*1000:.0f}mm (现实最快场景单轮位移)")
+    v_walk_max = 2.0 * DELTA_T
+    v_fast_max = 5.0 * DELTA_T
+    ax.axvline(v_walk_max, color=MUTED, linewidth=1.2, linestyle="--",
+               label=f"步行上限2m/s×Δt={v_walk_max*1000:.0f}mm")
+    ax.axvline(v_fast_max, color=INK, linewidth=1.2, linestyle="--",
+               label=f"快速上限5m/s×Δt={v_fast_max*1000:.0f}mm")
     ax.set_xscale("log")
     ax.set_xlabel("相邻两轮间的位移 Δd = v·Δt (m, 对数坐标)")
     ax.set_ylabel("std (无量纲, [0,1])")
-    ax.set_title(f"实验0b: std 随单轮位移 Δd 的响应曲线\n(标注已确认Δt={DELTA_T*1000:.0f}ms下, 2m/s\"快速运动\"对应的Δd)")
+    ax.set_title(f"实验0b: std 随单轮位移 Δd 的响应曲线\n(标注已确认Δt={DELTA_T*1000:.0f}ms下, 步行/快速上限对应的Δd)")
     ax.legend(frameon=False, fontsize=8, loc="upper left")
     fig.tight_layout()
     fig.savefig(os.path.join(RESULT_DIR, "exp0b_std_vs_motion.png"), dpi=160, bbox_inches="tight")
@@ -275,7 +290,8 @@ def experiment_0b_std_vs_motion():
     for snr in snr_list:
         dd_needed[snr] = float(np.interp(STD_TH_LOW, results[snr], delta_d_grid))
     return {"delta_d_needed_for_low_speed_threshold_m": dd_needed,
-            "realistic_max_delta_d_m": float(v_max_realistic)}
+            "walk_max_delta_d_m": float(v_walk_max),
+            "fast_max_delta_d_m": float(v_fast_max)}
 
 
 # --------------------------------------------------------------------------
@@ -284,8 +300,9 @@ def experiment_0b_std_vs_motion():
 def experiment_1_speed_response():
     n_trials = 300
 
-    # (a) 现实速度范围 (行人/手持场景)
-    v_true_grid_realistic = np.linspace(-2.0, 2.0, 41)
+    # (a)(b) 已确认的现实速度范围: 静止~慢速~步行~快速运动, 覆盖到DFT测速的
+    #        确认搜索边界 +-5 m/s
+    v_true_grid_realistic = np.linspace(-V_SEARCH_MAX, V_SEARCH_MAX, 41)
     snr_list = [10, 20, 30]
     colors = {10: C_ORANGE, 20: C_BLUE, 30: C_AQUA}
 
@@ -303,33 +320,34 @@ def experiment_1_speed_response():
             res_realistic[snr]["v_std"].append(np.std(v_hats))
             res_realistic[snr]["std_mean"].append(np.mean(stds))
 
-    # (b) 扩展速度范围(对数坐标), 固定高SNR, 用于展示DFT测速在信号足够强时的
-    #     无偏跟踪能力 —— 与(a)对照, 说明瓶颈在信号强度而非算法本身
-    v_true_grid_wide = np.concatenate([[0.0], np.logspace(-1, 2.5, 25)])  # 0, 0.1 ~ ~316 m/s
+    # (c) 探查DFT测速在已确认的 +-5m/s 搜索边界附近/之外的行为(超出搜索范围时,
+    #     搜索被限定在窗口内, 无法跟踪真实值, 只能看到窗口内的伪峰) —— 高SNR下
     snr_wide = 40
-    v_hat_wide_mean, v_hat_wide_std = [], []
-    for v_true in v_true_grid_wide:
+    v_true_grid_edge = np.linspace(0, 8.0, 33)  # 覆盖到超出确认搜索边界60%
+    v_hat_edge_mean, v_hat_edge_std = [], []
+    for v_true in v_true_grid_edge:
         v_hats = []
         for _ in range(n_trials):
             d_prev = rng.uniform(*D0_RANGE)
             d_curr = d_prev + v_true * DELTA_T
             v_hat, _, _ = measure_round_pair(d_prev, d_curr, snr_wide)
             v_hats.append(v_hat)
-        v_hat_wide_mean.append(np.mean(v_hats))
-        v_hat_wide_std.append(np.std(v_hats))
-    v_hat_wide_mean = np.array(v_hat_wide_mean)
-    v_hat_wide_std = np.array(v_hat_wide_std)
+        v_hat_edge_mean.append(np.mean(v_hats))
+        v_hat_edge_std.append(np.std(v_hats))
+    v_hat_edge_mean = np.array(v_hat_edge_mean)
+    v_hat_edge_std = np.array(v_hat_edge_std)
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.6))
 
     ax = axes[0]
-    ax.plot([-2, 2], [-2, 2], color=MUTED, linewidth=1.2, linestyle="--", label="理想 v_hat=v_true")
+    ax.plot([-V_SEARCH_MAX, V_SEARCH_MAX], [-V_SEARCH_MAX, V_SEARCH_MAX], color=MUTED, linewidth=1.2,
+            linestyle="--", label="理想 v_hat=v_true")
     for snr in snr_list:
         r = res_realistic[snr]
         ax.plot(v_true_grid_realistic, r["v_mean"], color=colors[snr], linewidth=2, label=f"SNR={snr}dB")
     ax.set_xlabel("真实速度 v_true (m/s)")
     ax.set_ylabel("v_hat (m/s)")
-    ax.set_title("(a) 现实速度范围: v_hat vs v_true\n(DFT相干增益下均值仍大致可跟踪, 但单次噪声大)")
+    ax.set_title(f"(a) 确认速度范围(±{V_SEARCH_MAX:.0f}m/s搜索窗): v_hat vs v_true\n(DFT相干增益下均值可跟踪, 单次噪声随SNR下降而增大)")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[1]
@@ -340,23 +358,23 @@ def experiment_1_speed_response():
     ax.axhline(STD_TH_LOW, color=C_CRIT, linewidth=1.0, linestyle=":", label=f"低速门限 {STD_TH_LOW}")
     ax.set_xlabel("真实速度 v_true (m/s)")
     ax.set_ylabel("std (无量纲)")
-    ax.set_title("(b) 现实速度范围: std vs v_true\n(std由SNR主导, 对速度不敏感)")
+    ax.set_title("(b) 确认速度范围: std vs v_true\n(仅在接近±5m/s边界时越过静止门限)")
     ax.legend(frameon=False, fontsize=8)
 
     ax = axes[2]
-    ax.plot([1e-1, 3e2], [1e-1, 3e2], color=MUTED, linewidth=1.2, linestyle="--", label="理想 v_hat=v_true")
-    ax.plot(v_true_grid_wide[1:], np.abs(v_hat_wide_mean[1:]), color=C_VIOLET, linewidth=2, marker="o",
-            markersize=4, label=f"v_hat 均值 (SNR={snr_wide}dB)")
-    ax.fill_between(v_true_grid_wide[1:], np.maximum(np.abs(v_hat_wide_mean[1:]) - v_hat_wide_std[1:], 1e-3),
-                     np.abs(v_hat_wide_mean[1:]) + v_hat_wide_std[1:], color=C_VIOLET, alpha=0.15, linewidth=0)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("真实速度 v_true (m/s, 对数坐标, 含非现实高速)")
-    ax.set_ylabel("|v_hat| (m/s, 对数坐标)")
-    ax.set_title(f"(c) 扩展速度范围: v_hat 何时开始\n无偏跟踪真实速度 (SNR={snr_wide}dB)")
+    ax.plot([0, V_SEARCH_MAX], [0, V_SEARCH_MAX], color=MUTED, linewidth=1.2, linestyle="--",
+            label="理想 v_hat=v_true")
+    ax.axvline(V_SEARCH_MAX, color=C_RED, linewidth=1.2, linestyle=":", label=f"确认搜索边界 {V_SEARCH_MAX:.0f}m/s")
+    ax.plot(v_true_grid_edge, v_hat_edge_mean, color=C_VIOLET, linewidth=2, marker="o", markersize=4,
+            label=f"v_hat 均值 (SNR={snr_wide}dB)")
+    ax.fill_between(v_true_grid_edge, v_hat_edge_mean - v_hat_edge_std, v_hat_edge_mean + v_hat_edge_std,
+                     color=C_VIOLET, alpha=0.15, linewidth=0)
+    ax.set_xlabel("真实速度 v_true (m/s, 含超出确认搜索边界的场景)")
+    ax.set_ylabel("v_hat (m/s)")
+    ax.set_title(f"(c) 搜索边界附近/之外的行为 (SNR={snr_wide}dB)\n(超过±5m/s后v_hat不再跟踪, 被限定在搜索窗内)")
     ax.legend(frameon=False, fontsize=8)
 
-    fig.suptitle("实验1: 修正公式后的速度响应特性 —— 现实速度范围 vs 信号充分强时的表现", y=1.03, fontsize=12)
+    fig.suptitle("实验1: 修正公式 + 已确认DFT搜索范围(±5m/s,0.05m/s分辨率)后的速度响应特性", y=1.03, fontsize=12)
     fig.tight_layout()
     fig.savefig(os.path.join(RESULT_DIR, "exp1_speed_response.png"), dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -365,7 +383,7 @@ def experiment_1_speed_response():
         "realistic_v_true_grid": v_true_grid_realistic.tolist(),
         "snr_list": snr_list,
         "std_mean_at_snr20_v0": float(res_realistic[20]["std_mean"][20]),
-        "std_mean_at_snr20_v2": float(res_realistic[20]["std_mean"][-1]),
+        "std_mean_at_snr20_vmax": float(res_realistic[20]["std_mean"][-1]),
     }
 
 
@@ -376,12 +394,14 @@ def experiment_2_std_distribution():
     snr_db = 20
     n_trials = 1000
 
+    # 与需求方确认的三级速度定义对齐: 慢速<0.3, 步行<2, 快速<5 m/s
     states = {
         "静止\n(v=0)": (0.0, 0.0),
-        "低速\n(0.05~0.3 m/s)": (0.05, 0.3),
-        "快速运动\n(0.5~2 m/s)": (0.5, 2.0),
+        "慢速\n(0.05~0.3 m/s)": (0.05, 0.3),
+        "步行\n(0.3~2 m/s)": (0.3, 2.0),
+        "快速\n(2~5 m/s)": (2.0, 5.0),
     }
-    box_colors = [C_AQUA, C_YELLOW, C_ORANGE]
+    box_colors = [C_AQUA, C_YELLOW, C_ORANGE, C_RED]
 
     data = {}
     for label, (vlo, vhi) in states.items():
@@ -407,7 +427,7 @@ def experiment_2_std_distribution():
     ax.set_xticks(positions)
     ax.set_xticklabels(list(data.keys()))
     ax.set_ylabel("std (无量纲)")
-    ax.set_title(f"实验2: 三种运动状态下 std 分布 (SNR={snr_db}dB, N={n_trials}次/组)\n(快速运动已明显分离, 但静止/低速仍高度重叠 —— 见实验0b成因分析)")
+    ax.set_title(f"实验2: 四级运动状态下 std 分布 (SNR={snr_db}dB, N={n_trials}次/组, 已确认速度分级)\n(步行/快速已明显抬升, 但静止/慢速仍高度重叠 —— 见实验0b成因分析)")
     ax.legend(frameon=False, fontsize=9, loc="upper left")
     fig.tight_layout()
     fig.savefig(os.path.join(RESULT_DIR, "exp2_std_distribution.png"), dpi=160, bbox_inches="tight")
@@ -424,10 +444,11 @@ def experiment_3_classifier_performance():
     snr_db = 20
     n_trials = 600
 
-    truth_states = {"static": (0.0, 0.0), "low_speed": (0.05, 0.3), "moving": (0.5, 2.0)}
-    order = ["static", "low_speed", "moving"]
+    # 与需求方确认的三级速度定义对齐: 慢速<0.3, 步行<2, 快速<5 m/s
+    truth_states = {"static": (0.0, 0.0), "slow": (0.05, 0.3), "walk": (0.3, 2.0), "fast": (2.0, 5.0)}
+    order = ["static", "slow", "walk", "fast"]
 
-    confusion = {t: {p: 0 for p in order} for t in order}
+    confusion = {t: {p: 0 for p in ["static", "low_speed", "moving"]} for t in order}
     for truth, (vlo, vhi) in truth_states.items():
         for _ in range(n_trials):
             v_true = 0.0 if vlo == vhi == 0.0 else rng.uniform(vlo, vhi) * rng.choice([-1, 1])
@@ -438,42 +459,44 @@ def experiment_3_classifier_performance():
             confusion[truth][pred] += 1
 
     std_th_grid = np.linspace(0.02, 1.0, 50)
-    static_stds, moving_stds = [], []
+    static_stds, fast_stds = [], []
     for _ in range(n_trials):
         d_prev = rng.uniform(*D0_RANGE)
         _, s, _ = measure_round_pair(d_prev, d_prev, snr_db)
         static_stds.append(s)
     for _ in range(n_trials):
-        v_true = rng.uniform(0.5, 2.0) * rng.choice([-1, 1])
+        v_true = rng.uniform(2.0, 5.0) * rng.choice([-1, 1])
         d_prev = rng.uniform(*D0_RANGE)
         d_curr = d_prev + v_true * DELTA_T
         _, s, _ = measure_round_pair(d_prev, d_curr, snr_db)
-        moving_stds.append(s)
-    static_stds, moving_stds = np.array(static_stds), np.array(moving_stds)
+        fast_stds.append(s)
+    static_stds, fast_stds = np.array(static_stds), np.array(fast_stds)
     det_rate = [float(np.mean(static_stds < th)) for th in std_th_grid]
-    far_rate = [float(np.mean(moving_stds < th)) for th in std_th_grid]
+    far_rate = [float(np.mean(fast_stds < th)) for th in std_th_grid]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.4))
 
     ax = axes[0]
-    mat = np.array([[confusion[t][p] for p in order] for t in order], dtype=float)
+    pred_order = ["static", "low_speed", "moving"]
+    mat = np.array([[confusion[t][p] for p in pred_order] for t in order], dtype=float)
     mat_norm = mat / mat.sum(axis=1, keepdims=True)
     ax.imshow(mat_norm, cmap="Blues", vmin=0, vmax=1)
-    ax.set_xticks(range(len(order)))
+    ax.set_xticks(range(len(pred_order)))
     ax.set_yticks(range(len(order)))
     label_map = {"static": "判静止", "low_speed": "判低速", "moving": "判运动"}
-    label_map_t = {"static": "真实静止", "low_speed": "真实低速", "moving": "真实运动"}
-    ax.set_xticklabels([label_map[p] for p in order])
+    label_map_t = {"static": "真实静止(v=0)", "slow": "真实慢速(<0.3)", "walk": "真实步行(0.3~2)",
+                   "fast": "真实快速(2~5)"}
+    ax.set_xticklabels([label_map[p] for p in pred_order])
     ax.set_yticklabels([label_map_t[t] for t in order])
     for i in range(len(order)):
-        for j in range(len(order)):
+        for j in range(len(pred_order)):
             ax.text(j, i, f"{mat_norm[i, j]*100:.0f}%\n({int(mat[i, j])})", ha="center", va="center",
                      color=INK if mat_norm[i, j] < 0.6 else "white", fontsize=9)
-    ax.set_title(f"(a) 混淆矩阵 (SNR={snr_db}dB, 现网阈值 0.6/0.3/0.1)")
+    ax.set_title(f"(a) 混淆矩阵 (SNR={snr_db}dB, 现网阈值 0.6/0.3/0.1,\n已确认速度分级)")
 
     ax = axes[1]
     ax.plot(std_th_grid, det_rate, color=C_BLUE, linewidth=2, label="真实静止 -> std<阈值 比例 (检出率)")
-    ax.plot(std_th_grid, far_rate, color=C_RED, linewidth=2, label="真实快速运动 -> std<阈值 比例 (虚警率)")
+    ax.plot(std_th_grid, far_rate, color=C_RED, linewidth=2, label="真实快速(2~5m/s) -> std<阈值 比例 (虚警率)")
     ax.axvline(STD_TH_STATIC, color=C_GOOD, linewidth=1.2, linestyle=":", label=f"现网静止门限 {STD_TH_STATIC}")
     ax.set_xlabel("std 判决门限")
     ax.set_ylabel("比例")
@@ -485,10 +508,10 @@ def experiment_3_classifier_performance():
     plt.close(fig)
 
     det_at_th = float(np.mean(static_stds < STD_TH_STATIC))
-    far_at_th = float(np.mean(moving_stds < STD_TH_STATIC))
+    far_at_th = float(np.mean(fast_stds < STD_TH_STATIC))
     return {"confusion": {t: confusion[t] for t in order},
             "static_detect_rate_at_threshold": det_at_th,
-            "moving_false_alarm_rate_at_threshold": far_at_th}
+            "fast_false_alarm_rate_at_threshold": far_at_th}
 
 
 # --------------------------------------------------------------------------
@@ -522,12 +545,14 @@ def apply_speed_gate(d_raw, v_hat_seq, std_seq, delta_t=DELTA_T):
     return d_out, states
 
 
-def build_scenario(kind, n_rounds=200, snr_db=20):
+def build_scenario(kind, n_rounds=60, snr_db=20):
     t = np.arange(n_rounds) * DELTA_T
     if kind == "static":
         d_true = np.full(n_rounds, 3.0) + rng.normal(0, 0.001, n_rounds)  # mm级静态微抖动
-    elif kind == "moving":
-        d_true = 3.0 + 0.3 * t  # 恒速 0.3 m/s
+    elif kind == "walk":
+        d_true = 3.0 + 1.2 * t  # 恒速 1.2 m/s, 典型步行速度("步行"档 0.3~2m/s 内)
+    elif kind == "fast":
+        d_true = 3.0 + 3.0 * t  # 恒速 3.0 m/s, "快速"档(2~5m/s)代表值
     elif kind == "transition":
         d_true = np.empty(n_rounds)
         seg1, seg2 = n_rounds // 3, 2 * n_rounds // 3
@@ -551,10 +576,11 @@ def build_scenario(kind, n_rounds=200, snr_db=20):
 
 
 def experiment_4_gating_traces():
-    scenarios = [("static", "静止场景(叠加多径野值)"), ("moving", "恒速运动场景 (0.3 m/s)"),
+    scenarios = [("static", "静止场景(叠加多径野值)"), ("walk", "步行场景 (1.2 m/s, 步行档 0.3~2m/s 代表值)"),
+                 ("fast", "快速场景 (3.0 m/s, 快速档 2~5m/s 代表值)"),
                  ("transition", "静止->运动->静止 过渡场景")]
 
-    fig, axes = plt.subplots(len(scenarios), 1, figsize=(9, 10), sharex=False)
+    fig, axes = plt.subplots(len(scenarios), 1, figsize=(9, 12.5), sharex=False)
     metrics = {}
     for ax, (kind, title) in zip(axes, scenarios):
         t, d_true, d_raw, d_out, v_hat_seq, std_seq, states = build_scenario(kind)
@@ -581,7 +607,7 @@ def experiment_4_gating_traces():
     return metrics
 
 
-def classify_state_oracle(v_true, low_speed_bound=0.5):
+def classify_state_oracle(v_true, low_speed_bound=2.0):
     """假设速度/状态判别完全准确(直接用真实速度 v_true 代入), 用于展示限幅逻辑
     本身在"上游判据准确"前提下的效果, 与实验0~3揭示的"当前占位参数下判据不够
     灵敏"问题相互独立地评估。"""
@@ -608,10 +634,11 @@ def apply_speed_gate_oracle(d_raw, v_true_seq, delta_t=DELTA_T):
 
 
 def experiment_5_oracle_gating():
-    scenarios = [("static", "静止场景(叠加多径野值)"), ("moving", "恒速运动场景 (0.3 m/s)"),
+    scenarios = [("static", "静止场景(叠加多径野值)"), ("walk", "步行场景 (1.2 m/s, 步行档 0.3~2m/s 代表值)"),
+                 ("fast", "快速场景 (3.0 m/s, 快速档 2~5m/s 代表值)"),
                  ("transition", "静止->运动->静止 过渡场景")]
 
-    fig, axes = plt.subplots(len(scenarios), 1, figsize=(9, 10), sharex=False)
+    fig, axes = plt.subplots(len(scenarios), 1, figsize=(9, 12.5), sharex=False)
     metrics = {}
     for ax, (kind, title) in zip(axes, scenarios):
         t, d_true, d_raw, _, _, _, _ = build_scenario(kind)
