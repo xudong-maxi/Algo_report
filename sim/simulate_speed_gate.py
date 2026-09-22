@@ -84,7 +84,10 @@ rng = np.random.default_rng(20260921)
 # 1. 仿真参数
 #    以下已由需求方确认为真实值(2026-09-22): K, Delta_f/N_F, Delta_t, 扫频频段,
 #    工作距离范围, DFT测速的搜索范围/分辨率, 三级速度定义。
-#    单频点 SNR 与基线测距(d_raw)野值/抖动特性仍为占位假设 —— TODO(实测)
+#    单频点 SNR 现网无上报, 只有 RSSI 上报(已确认: 1m处约-60dBm, 20m处约-80dBm),
+#    需要结合接收机噪底(热噪声+噪声系数NF)才能换算成SNR —— NF 是本仿真最后一个
+#    占位假设 TODO(实测/查芯片规格书确认NF)。基线测距(d_raw)野值/抖动特性仍为
+#    占位假设 —— TODO(实测)
 # --------------------------------------------------------------------------
 C_LIGHT = 3e8          # 光速 m/s
 K_PATH = 2             # 已确认: 双程(K=2)
@@ -98,8 +101,25 @@ V_SEARCH_MAX = 5.0     # DFT测速的搜索范围 (已确认: +-5 m/s)
 V_RESOLUTION = 0.05    # DFT测速的速度分辨率 (已确认: 0.05 m/s), 输出按此量化
 D0_RANGE = (1.0, 50.0) # 仿真使用的典型工作距离范围, m (已确认工作距离0~100m+,
                        # 占位地取中段作为默认场景; 该范围在修正后的公式下对
-                       # std/v_hat 数值基本无影响, 见4.3节循环不变性, 但真实
-                       # 单频点SNR会随距离大幅变化 —— 仍是最关键的未确认量 TODO(实测)
+                       # std/v_hat 数值基本无影响, 见4.3节循环不变性)
+
+# --- RSSI -> SNR 换算(已确认RSSI实测点, NF为占位假设) ---
+RSSI_AT_1M_DBM = -60.0     # 已确认: 1m处RSSI约-60dBm
+RSSI_AT_20M_DBM = -80.0    # 已确认: 20m处RSSI约-80dBm
+RX_NOISE_FIGURE_DB = 7.0   # 接收机噪声系数(NF)占位假设(典型2.4GHz低功耗射频芯片
+                           # 量级4~10dB, 取中间值)                    TODO(实测/查规格书)
+THERMAL_NOISE_DBM = -174.0 + 10 * np.log10(DELTA_F)  # 1MHz有效带宽热噪声基准
+NOISE_FLOOR_DBM = THERMAL_NOISE_DBM + RX_NOISE_FIGURE_DB
+# 由两个已确认RSSI点拟合的对数距离路径损耗指数(自由空间n=2, 此处<2可能反映近地反射
+# 增强等实际环境效应, 仅基于2个点外推, 100m处外推结果需实测校验)
+_PATH_LOSS_EXP = (RSSI_AT_1M_DBM - RSSI_AT_20M_DBM) / (10 * np.log10(20.0 / 1.0))
+
+
+def snr_from_distance(d_m):
+    """由已确认的RSSI实测点(1m/-60dBm, 20m/-80dBm)对数距离外推, 结合占位噪声系数
+    换算出给定工作距离下的单频点SNR(dB)。"""
+    rssi_dbm = RSSI_AT_1M_DBM - 10 * _PATH_LOSS_EXP * np.log10(d_m / 1.0)
+    return rssi_dbm - NOISE_FLOOR_DBM
 
 # 两档限幅阈值 (现网取值, 与用户确认)
 STD_TH_LOW = 0.6       # 低速档标准差门限 (无量纲, 见模块说明)
@@ -712,6 +732,75 @@ def experiment_6_cfo_invariance():
 
 
 # --------------------------------------------------------------------------
+# 实验7: 用已确认RSSI实测点换算出的真实SNR, 重新评估"步行"误判问题
+# --------------------------------------------------------------------------
+def experiment_7_real_snr_classification():
+    """现网已确认RSSI实测点(1m:-60dBm, 20m:-80dBm), 结合占位的接收机噪声系数(NF)
+    换算出各工作距离下的单频点SNR, 用真实(而非占位)SNR重新评估四级速度状态的
+    分类性能, 直接检验"步行误判静止"问题在真实SNR水平下是否依然存在。"""
+    distances = [1, 5, 10, 20, 50, 100]
+    n_trials = 1000
+
+    snr_by_distance = {d: float(snr_from_distance(d)) for d in distances}
+
+    walk_static_rate = {}
+    fast_static_rate = {}
+    std_walk_mean = {}
+    for d in distances:
+        snr_db = snr_by_distance[d]
+        walk_states, fast_states, walk_stds = [], [], []
+        for _ in range(n_trials):
+            v = rng.uniform(0.3, 2.0) * rng.choice([-1, 1])
+            v_hat, std_dphi, _ = measure_round_pair(d, d + v * DELTA_T, snr_db)
+            walk_states.append(classify_state(std_dphi, v_hat))
+            walk_stds.append(std_dphi)
+        for _ in range(n_trials):
+            v = rng.uniform(2.0, 5.0) * rng.choice([-1, 1])
+            v_hat, std_dphi, _ = measure_round_pair(d, d + v * DELTA_T, snr_db)
+            fast_states.append(classify_state(std_dphi, v_hat))
+        walk_static_rate[d] = float(np.mean([s == "static" for s in walk_states]))
+        fast_static_rate[d] = float(np.mean([s == "static" for s in fast_states]))
+        std_walk_mean[d] = float(np.mean(walk_stds))
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+
+    ax = axes[0]
+    ax.plot(distances, [snr_by_distance[d] for d in distances], color=C_VIOLET, linewidth=2,
+            marker="o", markersize=6)
+    ax.scatter([1, 20], [RSSI_AT_1M_DBM - NOISE_FLOOR_DBM, RSSI_AT_20M_DBM - NOISE_FLOOR_DBM],
+               color=C_RED, zorder=5, s=60, label="已确认RSSI实测点换算值")
+    ax.set_xscale("log")
+    ax.set_xlabel("工作距离 (m, 对数坐标)")
+    ax.set_ylabel("换算SNR (dB)")
+    ax.set_title(f"(a) 由已确认RSSI换算的单频点SNR随距离变化\n(NF={RX_NOISE_FIGURE_DB:.0f}dB占位假设, 1m/20m为实测点, 其余为外推)")
+    ax.legend(frameon=False, fontsize=8.5)
+
+    ax = axes[1]
+    ax.plot(distances, [walk_static_rate[d] * 100 for d in distances], color=C_ORANGE, linewidth=2,
+            marker="o", markersize=6, label="步行(0.3~2m/s)误判静止率")
+    ax.plot(distances, [fast_static_rate[d] * 100 for d in distances], color=C_AQUA, linewidth=2,
+            marker="s", markersize=6, label="快速(2~5m/s)误判静止率")
+    ax.set_xscale("log")
+    ax.set_xlabel("工作距离 (m, 对数坐标)")
+    ax.set_ylabel("误判为静止的比例 (%)")
+    ax.set_ylim(-5, 105)
+    ax.set_title("(b) 真实RSSI换算SNR下, 步行/快速运动的\n静止误判率随距离的变化")
+    ax.legend(frameon=False, fontsize=8.5)
+
+    fig.suptitle("实验7: 用已确认RSSI实测点换算的真实SNR重新评估\"步行误判\"问题", y=1.02, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(RESULT_DIR, "exp7_real_snr_classification.png"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    return {"snr_by_distance_db": snr_by_distance,
+            "walk_static_misclassify_rate": walk_static_rate,
+            "fast_static_misclassify_rate": fast_static_rate,
+            "std_walk_mean_by_distance": std_walk_mean,
+            "rx_noise_figure_db_assumed": RX_NOISE_FIGURE_DB,
+            "path_loss_exponent_fitted": float(_PATH_LOSS_EXP)}
+
+
+# --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
 def main():
@@ -731,6 +820,8 @@ def main():
     exp5 = experiment_5_oracle_gating()
     print("运行实验6: CFO不变性验证 ...")
     exp6 = experiment_6_cfo_invariance()
+    print("运行实验7: 真实RSSI换算SNR下的步行误判评估 ...")
+    exp7 = experiment_7_real_snr_classification()
 
     summary = {
         "params": {
@@ -743,6 +834,10 @@ def main():
             "V_TH_STATIC": V_TH_STATIC,
             "STATIC_RANGE_SCALE": STATIC_RANGE_SCALE,
             "D0_RANGE": D0_RANGE,
+            "RSSI_AT_1M_DBM": RSSI_AT_1M_DBM,
+            "RSSI_AT_20M_DBM": RSSI_AT_20M_DBM,
+            "RX_NOISE_FIGURE_DB": RX_NOISE_FIGURE_DB,
+            "NOISE_FLOOR_DBM": NOISE_FLOOR_DBM,
         },
         "exp0_std_vs_snr": exp0,
         "exp0b_std_vs_motion": exp0b,
@@ -752,6 +847,7 @@ def main():
         "exp4_gating_traces": exp4,
         "exp5_oracle_gating": exp5,
         "exp6_cfo_invariance": exp6,
+        "exp7_real_snr_classification": exp7,
     }
     with open(os.path.join(RESULT_DIR, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
