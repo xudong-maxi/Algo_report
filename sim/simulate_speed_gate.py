@@ -81,13 +81,17 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 rng = np.random.default_rng(20260921)
 
 # --------------------------------------------------------------------------
-# 1. 仿真参数 (占位假设, 需与实际星闪测距协议核对 —— TODO(实测))
+# 1. 仿真参数
+#    Delta_t 与扫频频段已由需求方确认为真实协议值(2026-09-22); 其余仍为占位
+#    假设, 需与实际星闪测距协议核对 —— TODO(实测)
 # --------------------------------------------------------------------------
 C_LIGHT = 3e8          # 光速 m/s
 K_PATH = 2             # 单程=1 / 双程=2, 占位取双程                         TODO(实测)
-N_F = 21               # 每次测量的频点(信道)数量, 占位                       TODO(实测)
-DELTA_F = 1e6          # 频点间隔 Hz, 占位 1MHz                              TODO(实测)
-DELTA_T = 0.01         # 相邻两次测量的时间间隔 s, 占位 10ms                  TODO(实测)
+F_START = 2400e6       # 扫频起始频率 Hz (已确认: 2400MHz)
+F_STOP = 2479e6        # 扫频终止频率 Hz (已确认: 2479MHz, 2.4G ISM频段)
+DELTA_F = 1e6          # 频点间隔 Hz, 占位 1MHz(信道间隔本身仍需现网核实)       TODO(实测)
+N_F = int(round((F_STOP - F_START) / DELTA_F)) + 1  # 由确认的频段/间隔推出, 79MHz/1MHz -> 80个频点
+DELTA_T = 0.2          # 相邻两次测量的时间间隔 s, 已确认: 200ms (5Hz测量率)
 NFFT = 4096            # DFT/IFFT 补零点数, 提高斜率(峰值)搜索分辨率
 D0_RANGE = (0.3, 3.0)  # 仿真使用的典型工作距离范围, m                        TODO(实测)
 
@@ -261,7 +265,7 @@ def experiment_0b_std_vs_motion():
     ax.set_xscale("log")
     ax.set_xlabel("相邻两轮间的位移 Δd = v·Δt (m, 对数坐标)")
     ax.set_ylabel("std (无量纲, [0,1])")
-    ax.set_title("实验0b: std 随单轮位移 Δd 的响应曲线\n(标注当前占位Δt=10ms下, 2m/s\"快速运动\"对应的Δd)")
+    ax.set_title(f"实验0b: std 随单轮位移 Δd 的响应曲线\n(标注已确认Δt={DELTA_T*1000:.0f}ms下, 2m/s\"快速运动\"对应的Δd)")
     ax.legend(frameon=False, fontsize=8, loc="upper left")
     fig.tight_layout()
     fig.savefig(os.path.join(RESULT_DIR, "exp0b_std_vs_motion.png"), dpi=160, bbox_inches="tight")
@@ -403,7 +407,7 @@ def experiment_2_std_distribution():
     ax.set_xticks(positions)
     ax.set_xticklabels(list(data.keys()))
     ax.set_ylabel("std (无量纲)")
-    ax.set_title(f"实验2: 三种运动状态下 std 分布 (SNR={snr_db}dB, N={n_trials}次/组)\n(修正公式后, 分布仍高度重叠 —— 见实验0b的成因分析)")
+    ax.set_title(f"实验2: 三种运动状态下 std 分布 (SNR={snr_db}dB, N={n_trials}次/组)\n(快速运动已明显分离, 但静止/低速仍高度重叠 —— 见实验0b成因分析)")
     ax.legend(frameon=False, fontsize=9, loc="upper left")
     fig.tight_layout()
     fig.savefig(os.path.join(RESULT_DIR, "exp2_std_distribution.png"), dpi=160, bbox_inches="tight")
